@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, redirect, Response, url_for
+        from flask import Flask, render_template, request, redirect, Response, url_for
 import pandas as pd
 from datetime import datetime
 import glob, os, io
@@ -8,10 +8,10 @@ app = Flask(__name__)
 # -----------------------------
 # נתיבי קבצים
 # -----------------------------
-ITEMS_XLSX = "items.xlsx"                  # עמודות: ItemCode, ItemDescription, Domain, Category, SubCategory
-CUSTOMERS_XLSX = "customers.xlsx"          # עמודות: CustomerID, CustomerName, SalesManager (אפשרי ריק)
-CUSTOMER_ITEMS_DIR = "customer_items"      # קבצי *.xlsx עם: CustomerID, ItemCode
-ORDERS_CSV = "orders.csv"                  # שמירת הזמנות (דמו) - בהמשך נחליף ל-DB
+ITEMS_XLSX = "items.xlsx"                  # ItemCode, ItemDescription, Domain, Category, SubCategory
+CUSTOMERS_XLSX = "customers.xlsx"          # CustomerID, CustomerName, SalesManager (יכול להיות ריק)
+CUSTOMER_ITEMS_DIR = "customer_items"      # קבצי *.xlsx: CustomerID, ItemCode
+ORDERS_CSV = "orders.csv"                  # דמו (בהמשך DB)
 
 SAP_CONST = {
     "Sales Order Type": "ZOR",
@@ -89,9 +89,6 @@ def next_order_number_export():
         return 1
 
 def save_order(customer_id: str, delivery_date: str, line_items: list):
-    """
-    line_items: list of dicts {item_code:str, quantity:float}
-    """
     ensure_orders_csv()
     now = datetime.utcnow()
     created_at_iso = now.isoformat()
@@ -139,7 +136,7 @@ def order_form():
     # POST = שמירת הזמנה
     if request.method == "POST":
         customer_id = (request.form.get("customer_id") or "").strip()
-        delivery_date = (request.form.get("delivery_date") or "").strip()  # YYYY-MM-DD
+        delivery_date = (request.form.get("delivery_date") or "").strip()
         if not customer_id:
             return "❌ יש לבחור לקוח. <a href='/'>חזרה</a>"
 
@@ -183,7 +180,7 @@ def order_form():
             df_cust_filtered["CustomerName"].str.strip().str.lower().str.contains(q)
         ]
 
-    # אחרי בחירת לקוח: סינון פריטים
+    # פריטים ללקוח
     items_for_ui = pd.DataFrame(columns=df_items.columns)
     domains, categories, subcats = [], [], []
     if selected_customer:
@@ -255,7 +252,7 @@ def export_sap():
     if df_orders.empty:
         return "אין הזמנות לייצא."
 
-    date_from = request.args.get("from")  # YYYY-MM-DD
+    date_from = request.args.get("from")
     date_to   = request.args.get("to")
     customer  = request.args.get("customer")
 
@@ -326,7 +323,7 @@ def export_sap():
     )
 
 # -----------------------------
-# run (לריצה מקומית/Render)
+# run
 # -----------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), debug=True)
