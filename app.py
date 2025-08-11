@@ -4,18 +4,11 @@ import io
 import os
 import glob
 from datetime import datetime
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, Iterable
 
 import pandas as pd
 from flask import (
-    Flask,
-    render_template,
-    request,
-    redirect,
-    url_for,
-    send_file,
-    Response,
-    jsonify,
+    Flask, render_template, request, send_file, jsonify
 )
 
 # -----------------------------
@@ -25,9 +18,24 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CUSTOMERS_XLSX = os.path.join(BASE_DIR, "customers.xlsx")
 ITEMS_XLSX = os.path.join(BASE_DIR, "items.xlsx")
 CUSTOMER_ITEMS_DIR = os.path.join(BASE_DIR, "customer_items")
-ORDERS_XLSX = os.path.join(BASE_DIR, "orders.xlsx")  # אחסון ההזמנות
+ORDERS_XLSX = os.path.join(BASE_DIR, "orders.xlsx")  # אחסון ההזמנות המצטברות
 
-# עמודות חובה
+# שמות עמודות "קנוניים" אחרי נרמול
+CANON_CUSTOMERS = {
+    "customernumber": "CustomerNumber",  # תומך גם ב-CustomerID/Number
+    "customerid": "CustomerNumber",
+    "customername": "CustomerName",
+    "salesmanager": "SalesManager",
+}
+CANON_ITEMS = {
+    "itemcode": "ItemCode",             # תומך גם ב-MaterialNumber
+    "materialnumber": "ItemCode",
+    "itemdescription": "ItemDescription",
+    "category": "Category",
+    "subcategory": "SubCategory",
+    "domain": "Domain",
+}
+
 REQUIRED_CUSTOMERS = {"CustomerNumber", "CustomerName", "SalesManager"}
 REQUIRED_ITEMS = {"ItemCode", "ItemDescription", "Category", "SubCategory", "Domain"}
 
@@ -35,35 +43,86 @@ REQUIRED_ITEMS = {"ItemCode", "ItemDescription", "Category", "SubCategory", "Dom
 app = Flask(__name__)
 
 # -----------------------------
-# Utils – טעינת נתונים
+# Utils
 # -----------------------------
-def _assert_columns(df: pd.DataFrame, required: set, fname: str) -> None:
+def get_arg(*names: Iterable[str], default: str = "") -> str:
+    """קורא פרמטר בקשות ותומך בכמה שמות חלופיים."""
+    for n in names:
+        val = request.args.get(n)
+        if val is not None:
+            return val.strip()
+    return default
+
+def normalize_headers(df: pd.DataFrame, mapping: Dict[str, str]) -> pd.DataFrame:
+    """
+    מנרמל כותרות טבלה: lowercase, ללא רווחים/קווים תחתונים, וממפה לשמות הקנוניים.
+    לדוגמה 'Customer ID' -> 'customernumber' -> 'CustomerNumber'.
+    """
+    raw_cols = list(df.columns)
+    norm_to_raw = {}
+    for c in raw_cols:
+        key = str(c).strip().lower().replace(" ", "").replace("_", "")
+        norm_to_raw[key] = c
+
+    # החלפת שמות לעמודות הקנוניות אם יש התאמות
+    rename_dict = {}
+    for norm_key, raw_name in norm_to_raw.items():
+        if norm_key in mapping:
+            rename_dict[raw_name] = mapping[norm_key]
+        else:
+            # אם לא ידוע – השאר את השם המקורי
+            rename_dict[raw_name] = raw_name
+
+    df = df.rename(columns=rename_dict)
+    return df
+
+def assert_required(df: pd.DataFrame, required: set, fname: str) -> None:
     missing = required.difference(df.columns)
     if missing:
         raise ValueError(f"{os.path.basename(fname)} missing columns: {missing}")
 
+def safe_read_excel(path: str, dtype: dict | None = None) -> pd.DataFrame:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Missing file: {os.path.basename(path)}")
+    # engine=openpyxl עוזר להפחית שוני בפרשנות
+    return pd.read_excel(path, dtype=dtype or {}, engine="openpyxl")
+
+# -----------------------------
+# טעינת נתונים
+# -----------------------------
 def load_customers() -> pd.DataFrame:
-    df = pd.read_excel(CUSTOMERS_XLSX, dtype={"CustomerNumber": str})
-    _assert_columns(df, REQUIRED_CUSTOMERS, CUSTOMERS_XLSX)
-    # ניקוי קל
-    df["CustomerNumber"] = df["CustomerNumber"].str.strip()
+    df = safe_read_excel(CUSTOMERS_XLSX, dtype=str)
+    df = normalize_headers(df, CANON_CUSTOMERS)
+    assert_required(df, REQUIRED_CUSTOMERS, CUSTOMERS_XLSX)
+
+    # ניקוי
+    df["CustomerNumber"] = df["CustomerNumber"].astype(str).str.strip()
     df["CustomerName"] = df["CustomerName"].astype(str).str.strip()
     df["SalesManager"] = df["SalesManager"].astype(str).str.strip()
-    # הסרת כפילויות אם יש
+
+    # הסרת כפילויות
     df = df.drop_duplicates(subset=["CustomerNumber"]).reset_index(drop=True)
     return df
 
 def load_items() -> pd.DataFrame:
-    df = pd.read_excel(ITEMS_XLSX, dtype={"ItemCode": str})
-    _assert_columns(df, REQUIRED_ITEMS, ITEMS_XLSX)
-    df["ItemCode"] = df["ItemCode"].str.strip()
+    df = safe_read_excel(ITEMS_XLSX, dtype=str)
+    df = normalize_headers(df, CANON_ITEMS)
+    assert_required(df, REQUIRED_ITEMS, ITEMS_XLSX)
+
+    df["ItemCode"] = df["ItemCode"].astype(str).str.strip()
+    df["ItemDescription"] = df["ItemDescription"].astype(str).str.strip()
+    df["Category"] = df["Category"].astype(str).str.strip()
+    df["SubCategory"] = df["SubCategory"].astype(str).str.strip()
+    df["Domain"] = df["Domain"].astype(str).str.strip()
     return df
 
 def load_customer_allowed_items(customer_number: str) -> Optional[pd.DataFrame]:
     """
-    קורא את קבצי הלקוח מתיקיית customer_items.
-    תמיכה בקובץ יחיד {Cust}.xlsx או כמה קבצים בשם {Cust}_*.xlsx.
-    מחזיר DF עם ItemCode, אחרת None אם אין קובץ – משמע מותר כל הפריטים.
+    קורא קבצי פריטים לפי לקוח מתיקיית customer_items.
+    תומך:
+    - {Cust}.xlsx
+    - {Cust}_*.xlsx (פיצול לכמה קבצים)
+    מצפה לעמודה ItemCode או MaterialNumber.
     """
     pattern_main = os.path.join(CUSTOMER_ITEMS_DIR, f"{customer_number}.xlsx")
     pattern_multi = os.path.join(CUSTOMER_ITEMS_DIR, f"{customer_number}_*.xlsx")
@@ -74,16 +133,14 @@ def load_customer_allowed_items(customer_number: str) -> Optional[pd.DataFrame]:
     frames = []
     for f in files:
         try:
-            df = pd.read_excel(f, dtype={"ItemCode": str})
-            # תומך באחת משתי אפשרויות שמות עמודות
-            if "ItemCode" not in df.columns and "MaterialNumber" in df.columns:
-                df = df.rename(columns={"MaterialNumber": "ItemCode"})
+            df = pd.read_excel(f, dtype=str, engine="openpyxl")
+            df = normalize_headers(df, {"itemcode": "ItemCode", "materialnumber": "ItemCode"})
             if "ItemCode" not in df.columns:
                 continue
             df["ItemCode"] = df["ItemCode"].astype(str).str.strip()
             frames.append(df[["ItemCode"]].dropna())
-        except Exception:
-            continue
+        except Exception as ex:
+            print(f"[WARN] could not read {os.path.basename(f)}: {ex}")
 
     if not frames:
         return None
@@ -92,19 +149,16 @@ def load_customer_allowed_items(customer_number: str) -> Optional[pd.DataFrame]:
     return merged
 
 # -----------------------------
-# עזר לסינון לקוחות
+# סינון לקוחות
 # -----------------------------
-def filter_customers(
-    customers: pd.DataFrame,
-    sales_manager: Optional[str],
-    query: Optional[str],
-) -> pd.DataFrame:
+def filter_customers(customers: pd.DataFrame, sales_manager: str, query: str) -> pd.DataFrame:
     df = customers.copy()
-    if sales_manager and sales_manager.strip():
-        df = df[df["SalesManager"].str.casefold() == sales_manager.strip().casefold()]
 
-    if query and query.strip():
-        q = query.strip().casefold()
+    if sales_manager:
+        df = df[df["SalesManager"].str.casefold() == sales_manager.casefold()]
+
+    if query:
+        q = query.casefold()
         by_number = df["CustomerNumber"].str.contains(q, case=False, na=False)
         by_name = df["CustomerName"].str.casefold().str.contains(q, na=False)
         df = df[by_number | by_name]
@@ -112,42 +166,45 @@ def filter_customers(
     return df.sort_values(by=["CustomerName", "CustomerNumber"]).reset_index(drop=True)
 
 # -----------------------------
-# נתיב בריאות ל-Render
+# Health
 # -----------------------------
 @app.get("/health")
 def health() -> Tuple[str, int]:
     return "ok", 200
 
 # -----------------------------
-# דף ראשי – טופס הזמנה
+# UI ראשי – טופס הזמנה
 # -----------------------------
 @app.get("/")
 def order_form():
-    customers = load_customers()
-    items = load_items()
+    try:
+        customers = load_customers()
+        items = load_items()
+    except Exception as ex:
+        # הודעת שגיאה ידידותית בדף הראשי במקום 500
+        return f"<h3>Data error</h3><pre>{ex}</pre>", 200
 
-    # פרמטרים מה-UI לסינון לקוחות
-    sales_manager = request.args.get("sm", "").strip()
-    customer_query = request.args.get("cq", "").strip()
-    selected_customer = request.args.get("cid", "").strip()
+    # תמיכה בשמות פרמטרים ארוכים/קצרים מה-UI
+    sales_manager = get_arg("sm", "sales_manager")
+    customer_query = get_arg("cq", "customer_search")
+    selected_customer = get_arg("cid", "customer_id")
 
     filtered_customers = filter_customers(customers, sales_manager, customer_query)
 
-    # אם נבחר לקוח – נסנן את רשימת הפריטים לפי קבצי הלקוח
+    # אם נבחר לקוח – הגבל פריטים מותריים
     df_items_view = items.copy()
     if selected_customer:
         allowed = load_customer_allowed_items(selected_customer)
         if allowed is not None and not allowed.empty:
             df_items_view = df_items_view.merge(allowed, on="ItemCode", how="inner")
 
-    # הפיכת רשימות לתבנית
-    sales_managers = sorted(customers["SalesManager"].dropna().unique().tolist())
-    customers_list = filtered_customers[["CustomerNumber", "CustomerName"]].to_dict("records")
-
-    # קיבוץ פריטים לפי קטגוריה/תת-קטגוריה (למיון בתבנית)
+    # מיון ידידותי להצגה
     df_items_view = df_items_view.sort_values(
         by=["Category", "SubCategory", "ItemDescription", "ItemCode"]
     ).reset_index(drop=True)
+
+    sales_managers = sorted(customers["SalesManager"].dropna().unique().tolist())
+    customers_list = filtered_customers[["CustomerNumber", "CustomerName"]].to_dict("records")
 
     return render_template(
         "form.html",
@@ -165,42 +222,45 @@ def order_form():
 @app.post("/submit")
 def submit_order():
     """
-    מצפה לשדות:
-    - customer_id
-    - delivery_date (אופציונלי)
-    - order_rows: רשימת שורות {ItemCode, Quantity} בכמות > 0
+    גוף הבקשה (JSON או form):
+    - customer_id (חובה)
+    - delivery_date (אופציונלי, לא נשמר כרגע לקובץ SAP אלא לשימוש עתידי)
+    - order_rows: [{ItemCode, Quantity}, ...] (נשמרים רק עם Quantity > 0)
     """
-    data = request.get_json(silent=True) or request.form.to_dict(flat=False)
-
-    # תמיכה גם ב-form וגם ב-JSON
-    customer_id = (data.get("customer_id") or [""])[0] if isinstance(data, dict) else ""
-    delivery_date = (data.get("delivery_date") or [""])[0] if isinstance(data, dict) else ""
-    order_rows = data.get("order_rows", [])
+    data = request.get_json(silent=True)
+    if not data:
+        # תמיכה ב-form
+        data = request.form.to_dict(flat=False)
+        customer_id = (data.get("customer_id") or [""])[0]
+        delivery_date = (data.get("delivery_date") or [""])[0]
+        order_rows = []
+    else:
+        customer_id = str(data.get("customer_id", "")).strip()
+        delivery_date = str(data.get("delivery_date", "")).strip()
+        order_rows = data.get("order_rows", [])
 
     if not customer_id:
         return jsonify({"ok": False, "error": "Missing customer_id"}), 400
 
-    # המרת delivery_date
-    ref_date = datetime.utcnow().strftime("%d%m%Y")  # Reference Date בפורמט DDMMYYYY
+    # Reference Date בפורמט DDMMYYYY
+    ref_date = datetime.utcnow().strftime("%d%m%Y")
 
-    # קריאת קובץ הזמנות קיים (אם יש)
-    existing = []
+    # קריאת הזמנות קיימות
+    existing: list[dict] = []
     if os.path.exists(ORDERS_XLSX):
         try:
-            existing_df = pd.read_excel(ORDERS_XLSX, dtype=str)
+            existing_df = pd.read_excel(ORDERS_XLSX, dtype=str, engine="openpyxl")
             existing = existing_df.to_dict("records")
-        except Exception:
-            existing = []
+        except Exception as ex:
+            print(f"[WARN] failed reading {os.path.basename(ORDERS_XLSX)}: {ex}")
 
-    # Order Number רץ: 1 + המקסימום הקיים
+    # מספר הזמנה רץ
     try:
-        next_order_num = (
-            max([int(r.get("OrderNumber", 0)) for r in existing], default=0) + 1
-        )
+        next_order_num = max([int(r.get("OrderNumber", 0)) for r in existing] or [0]) + 1
     except Exception:
         next_order_num = 1
 
-    # המרת שורות להזמנה: נשמור רק כמות > 0
+    # בניית שורות שמורות (רק Quantity > 0)
     rows = []
     for row in order_rows:
         try:
@@ -213,13 +273,13 @@ def submit_order():
 
         rows.append(
             {
-                # שדות משתנים לפי הדרישה
+                # משתנה לפי הדרישה
                 "OrderNumber": str(next_order_num),
                 "CustomerNumber": str(customer_id),
                 "MaterialNumber": code,
                 "OrderQuantity": qty,
                 "CustomerReferenceDate": ref_date,
-                # שדות קבועים לדוגמת SAP – ניתן להתאים לפי הצורך
+                # קבועים (ניתנים לשינוי לפי הצורך)
                 "SalesOrderType": "ZOR",
                 "SalesOrg": "1652",
                 "DistributionChannel": "01",
@@ -229,46 +289,49 @@ def submit_order():
                 "CustomerPOReference": "Pepperi Backup",
                 "UnitOfMeasure": "CS",
                 "PurchaseOrderType": "EXO",
+                # מידע שאולי נרצה להוסיף בעתיד:
+                "DeliveryDate": delivery_date or "",
             }
         )
 
     if not rows:
         return jsonify({"ok": False, "error": "No items with quantity > 0"}), 400
 
-    # כתיבה לאקסל (מצטבר, לא מוחק)
+    # כתיבה מצטברת (לא מוחק הזמנות עבר)
     final_df = pd.DataFrame([*existing, *rows])
-    final_df.to_excel(ORDERS_XLSX, index=False)
+    final_df.to_excel(ORDERS_XLSX, index=False, engine="openpyxl")
 
     return jsonify({"ok": True, "order_number": next_order_num, "rows": len(rows)})
 
 # -----------------------------
-# ייצוא קובץ הזמנות (אדמין)
-# תמיכה במסננים: from_date (DDMMYYYY), to_date (DDMMYYYY)
+# ייצוא הזמנות (עם סינון תאריכים אופציונלי)
+# from_date/to_date בפורמט DDMMYYYY
 # -----------------------------
 @app.get("/export")
 def export_orders():
+    columns_order = [
+        "OrderNumber",
+        "CustomerNumber",
+        "MaterialNumber",
+        "OrderQuantity",
+        "CustomerReferenceDate",
+        "SalesOrderType",
+        "SalesOrg",
+        "DistributionChannel",
+        "Division",
+        "SoldToParty",
+        "ShipToParty",
+        "CustomerPOReference",
+        "UnitOfMeasure",
+        "PurchaseOrderType",
+        "DeliveryDate",
+    ]
+
     if not os.path.exists(ORDERS_XLSX):
-        # קובץ ריק
-        empty = pd.DataFrame(
-            columns=[
-                "OrderNumber",
-                "CustomerNumber",
-                "MaterialNumber",
-                "OrderQuantity",
-                "CustomerReferenceDate",
-                "SalesOrderType",
-                "SalesOrg",
-                "DistributionChannel",
-                "Division",
-                "SoldToParty",
-                "ShipToParty",
-                "CustomerPOReference",
-                "UnitOfMeasure",
-                "PurchaseOrderType",
-            ]
-        )
+        # קובץ ריק במבנה נכון
+        empty = pd.DataFrame(columns=columns_order)
         buf = io.BytesIO()
-        empty.to_excel(buf, index=False)
+        empty.to_excel(buf, index=False, engine="openpyxl")
         buf.seek(0)
         return send_file(
             buf,
@@ -277,9 +340,15 @@ def export_orders():
             mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
-    df = pd.read_excel(ORDERS_XLSX, dtype=str)
-    from_date = request.args.get("from_date", "").strip()
-    to_date = request.args.get("to_date", "").strip()
+    df = pd.read_excel(ORDERS_XLSX, dtype=str, engine="openpyxl")
+
+    # ודא שכל העמודות קיימות גם אם נוספו מאוחר יותר
+    for col in columns_order:
+        if col not in df.columns:
+            df[col] = ""
+
+    from_date = get_arg("from_date")
+    to_date = get_arg("to_date")
 
     def _to_dt(s: str) -> Optional[datetime]:
         try:
@@ -290,7 +359,6 @@ def export_orders():
     if from_date or to_date:
         fdt = _to_dt(from_date) if from_date else None
         tdt = _to_dt(to_date) if to_date else None
-        # ממירים את השדה במידת הצורך
         df["_dt"] = df["CustomerReferenceDate"].apply(_to_dt)
         if fdt:
             df = df[df["_dt"] >= fdt]
@@ -298,15 +366,15 @@ def export_orders():
             df = df[df["_dt"] <= tdt]
         df = df.drop(columns=["_dt"])
 
-    # ייצוא
+    df = df[columns_order]  # סדר עמודות עקבי
+
     buf = io.BytesIO()
-    df.to_excel(buf, index=False)
+    df.to_excel(buf, index=False, engine="openpyxl")
     buf.seek(0)
-    filename = f"orders_export_{datetime.utcnow():%Y%m%d_%H%M}.xlsx"
     return send_file(
         buf,
         as_attachment=True,
-        download_name=filename,
+        download_name=f"orders_export_{datetime.utcnow():%Y%m%d_%H%M}.xlsx",
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
@@ -315,5 +383,4 @@ def export_orders():
 # -----------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
-    # מאפשר להריץ גם מקומית וגם על Render ללא Gunicorn
     app.run(host="0.0.0.0", port=port)
