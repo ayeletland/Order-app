@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+  <meta charset="utf-8" />
+  <title>אפליקציית הזמנות</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; margin: 16px; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+    label { font-weight: 600; }
+    select, input[type=text], input[type=date] { padding: 6px; font-size: 14px; }
+    table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+    th, td { border: 1px solid #ddd; padding: 8px; font-size: 14px; }
+    th { background: #f7f7f7; }
+    .sticky { position: sticky; top: 0; background: #fff; padding: 8px 0; }
+    .actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .btn { padding: 8px 12px; border: 1px solid #ccc; background: #fafafa; cursor: pointer; border-radius: 6px;}
+    .btn.primary { background: #005bbb; color: #fff; border-color: #005bbb; }
+    .muted { color: #666; font-size: 13px; }
+    .grid { display: grid; gap: 8px; }
+    .grid-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    .grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .pill { background:#eef3ff; padding:4px 8px; border-radius:999px; font-size:12px;}
+  </style>
+</head>
+<body>
+
+  <h2>אפליקציית הזמנות</h2>
+
+  <!-- סינון לקוחות -->
+  <form method="get" action="/" class="grid grid-4">
+    <div>
+      <label>מנהל מכירות</label><br/>
+      <select name="sales_manager" onchange="this.form.submit()">
+        <option value="">— הכל —</option>
+        {% for sm in sales_managers %}
+          <option value="{{ sm }}" {% if sm == selected_sales_manager %}selected{% endif %}>{{ sm }}</option>
+        {% endfor %}
+      </select>
+    </div>
+
+    <div>
+      <label>סינון לקוח (שם/מס׳)</label><br/>
+      <input type="text" name="customer_search" value="{{ customer_search }}" placeholder="חפשי לפי שם או מספר" />
+    </div>
+
+    <div>
+      <label>בחרי לקוח</label><br/>
+      <select name="customer_id">
+        <option value="">— בחרי —</option>
+        {% for _, c in customers.iterrows() %}
+          <option value="{{ c.CustomerNumber }}" {% if c.CustomerNumber == customer_id %}selected{% endif %}>
+            {{ c.CustomerNumber }} — {{ c.CustomerName }}
+          </option>
+        {% endfor %}
+      </select>
+    </div>
+
+    <div style="align-self:end">
+      <button class="btn primary" type="submit">סנכרן סינון לקוחות</button>
+    </div>
+  </form>
+
+  {% if customer_id %}
+  <hr/>
+
+  <!-- שורת בחירת "פריטים להצגה" + מסננים -->
+  <form method="get" action="/" class="row">
+    <input type="hidden" name="customer_id" value="{{ customer_id }}" />
+    <input type="hidden" name="sales_manager" value="{{ selected_sales_manager }}" />
+    <input type="hidden" name="customer_search" value="{{ customer_search }}" />
+
+    <div>
+      <label>פריטים להצגה</label><br/>
+      <select name="show_set" onchange="this.form.submit()">
+        <option value="customer" {% if show_set=='customer' %}selected{% endif %}>פריטי לקוח</option>
+        <option value="all" {% if show_set=='all' %}selected{% endif %}>כלל הפריטים</option>
+      </select>
+    </div>
+
+    <div>
+      <label>Domain</label><br/>
+      <select name="domain" onchange="this.form.submit()">
+        <option value="">— הכל —</option>
+        {% for d in domains %}
+          <option value="{{ d }}" {% if d==domain_selected %}selected{% endif %}>{{ d }}</option>
+        {% endfor %}
+      </select>
+    </div>
+
+    <div>
+      <label>Category</label><br/>
+      <select name="category" onchange="this.form.submit()">
+        <option value="">— הכל —</option>
+        {% for c in categories %}
+          <option value="{{ c }}" {% if c==category_selected %}selected{% endif %}>{{ c }}</option>
+        {% endfor %}
+      </select>
+    </div>
+
+    <div>
+      <label>SubCategory</label><br/>
+      <select name="subcategory" onchange="this.form.submit()">
+        <option value="">— הכל —</option>
+        {% for s in subcategories %}
+          <option value="{{ s }}" {% if s==subcategory_selected %}selected{% endif %}>{{ s }}</option>
+        {% endfor %}
+      </select>
+    </div>
+
+    <div>
+      <label>חיפוש פריט (שם/מק״ט)</label><br/>
+      <input type="text" name="q" value="{{ q }}" placeholder="לדוגמה: 12345 או חטיף" />
+    </div>
+
+    <div style="align-self:end">
+      <button class="btn" type="submit">סנכרן תצוגת פריטים</button>
+      <a class="btn" href="{{ url_for('cart_view', customer_id=customer_id) }}">צפי בעגלה ({{ customer_cart|length }})</a>
+    </div>
+  </form>
+
+  <!-- טבלת פריטים -->
+  <form method="post" action="{{ url_for('update_cart') }}">
+    <input type="hidden" name="customer_id" value="{{ customer_id }}"/>
+    <div class="muted">לקוח נבחר: <span class="pill">{{ customer_id }}</span></div>
+    <table>
+      <thead>
+        <tr>
+          <th>מק״ט</th>
+          <th>פריט</th>
+          <th>Domain</th>
+          <th>Category</th>
+          <th>SubCategory</th>
+          <th>כמות</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% if items is not none and not items.empty %}
+          {% for _, it in items.iterrows() %}
+            {% set code = it.ItemCode %}
+            <tr>
+              <td>{{ code }}</td>
+              <td>{{ it.ItemName }}</td>
+              <td>{{ it.Domain }}</td>
+              <td>{{ it.Category }}</td>
+              <td>{{ it.SubCategory }}</td>
+              <td>
+                <input type="number" step="0.01" min="0" name="qty_{{ code }}"
+                       value="{{ customer_cart.get(code, {}).get('qty', '') }}"
+                       style="width: 100px;"/>
+              </td>
+            </tr>
+          {% endfor %}
+        {% else %}
+          <tr><td colspan="6" class="muted">אין פריטים לתצוגה — בחרי מסנן אחר</td></tr>
+        {% endif %}
+      </tbody>
+    </table>
+
+    <div class="row" style="margin-top:12px">
+      <button class="btn primary" type="submit">שמרי כמויות בעגלה</button>
+      <a class="btn" href="{{ url_for('cart_view', customer_id=customer_id) }}">לעגלה</a>
+
+      <div style="margin-inline-start:auto">
+        <form method="post" action="{{ url_for('submit_order') }}" style="display:inline;">
+          <input type="hidden" name="customer_id" value="{{ customer_id }}" />
+          <input type="hidden" name="sales_manager" value="{{ selected_sales_manager }}" />
+          תאריך אספקה:
+          <input type="date" name="delivery_date" />
+          <button class="btn" type="submit">שלחי הזמנה</button>
+        </form>
+      </div>
+    </div>
+  </form>
+  {% else %}
+    <p class="muted">בחרי לקוח כדי להציג פריטים ולהוסיף לעגלה.</p>
+  {% endif %}
+
+  <hr/>
+  <div class="row">
+    <a class="btn" href="{{ url_for('admin') }}">אדמין</a>
+  </div>
+
+</body>
+</html>
