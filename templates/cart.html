@@ -1,1 +1,71 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>סל הזמנה</title>
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; margin: 10px; }
+    header, form, table { max-width: 1000px; margin: 0 auto; }
+    table { border-collapse: collapse; width: 100%; margin-top: 12px; }
+    th, td { border:1px solid #ccc; padding:6px 8px; vertical-align: middle; }
+    th { background:#f6f6f6; position: sticky; top:0; }
+    .qty { width: 100px; }
+    .row { display:flex; gap:10px; flex-wrap:wrap; align-items:end; }
+  </style>
+</head>
+<body>
 
+<header class="row" style="justify-content:space-between;">
+  <div><a href="{{ url_for('order_form') }}">↩ חזרה להזמנה</a></div>
+  <div>סה״כ פריטים בסל: <strong>{{ cart_size }}</strong></div>
+</header>
+
+<form method="post" action="{{ url_for('cart_view') }}">
+  <table>
+    <thead>
+      <tr>
+        <th>Domain</th>
+        <th>Category</th>
+        <th>SubCategory</th>
+        <th>קוד</th>
+        <th>שם פריט</th>
+        <th>כמות</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in rows %}
+      <tr>
+        <td>{{ r.Domain }}</td>
+        <td>{{ r.Category }}</td>
+        <td>{{ r.SubCategory }}</td>
+        <td>{{ r.ItemCode }}</td>
+        <td>{{ r.ItemName }}</td>
+        <td>
+          <input class="qty" type="number" min="0" name="qty_{{ r.ItemCode }}" value="{{ r.qty }}">
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  <div style="display:flex; justify-content:space-between; margin-top:10px;">
+    <button type="submit">עדכן כמויות</button>
+
+    <!-- טופס שליחת הזמנה: מחייב לקוח בדף הראשי, לכן נשמור customer_id בצד -->
+    <form method="post" action="{{ url_for('submit_order') }}" style="margin:0;">
+      <!-- אם תרצי: אפשר גם לאכוף customer_id ע״י input hidden שמוזן מהדף הראשי -->
+    </form>
+  </div>
+</form>
+
+<!-- שליחת הזמנה (דורשת customer_id; מקובל לשלוח מהדף הראשי עם כפתור ייעודי.
+     אם תרצי כאן – נוסיף select לקוחות/שדה hidden.) -->
+<form method="post" action="{{ url_for('submit_order') }}" style="max-width:1000px; margin:12px auto 0">
+  <label>מספר לקוח למשלוח ההזמנה (CustomerNumber)</label>
+  <input type="text" name="customer_id" required placeholder="לדוגמה: 28241064" />
+  <button type="submit">שלח הזמנה</button>
+</form>
+
+</body>
+</html>
