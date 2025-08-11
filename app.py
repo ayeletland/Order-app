@@ -1,329 +1,319 @@
-from flask import Flask, render_template, request, redirect, Response, url_for
-import pandas as pd
-from datetime import datetime
-import glob, os, io
+from __future__ import annotations
 
+import io
+import os
+import glob
+from datetime import datetime
+from typing import Optional, Tuple
+
+import pandas as pd
+from flask import (
+    Flask,
+    render_template,
+    request,
+    redirect,
+    url_for,
+    send_file,
+    Response,
+    jsonify,
+)
+
+# -----------------------------
+# Config – נתיבים ושמות קבצים
+# -----------------------------
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CUSTOMERS_XLSX = os.path.join(BASE_DIR, "customers.xlsx")
+ITEMS_XLSX = os.path.join(BASE_DIR, "items.xlsx")
+CUSTOMER_ITEMS_DIR = os.path.join(BASE_DIR, "customer_items")
+ORDERS_XLSX = os.path.join(BASE_DIR, "orders.xlsx")  # אחסון ההזמנות
+
+# עמודות חובה
+REQUIRED_CUSTOMERS = {"CustomerNumber", "CustomerName", "SalesManager"}
+REQUIRED_ITEMS = {"ItemCode", "ItemDescription", "Category", "SubCategory", "Domain"}
+
+# Flask
 app = Flask(__name__)
 
 # -----------------------------
-# נתיבי קבצים
+# Utils – טעינת נתונים
 # -----------------------------
-ITEMS_XLSX = "items.xlsx"                  # ItemCode, ItemDescription, Domain, Category, SubCategory
-CUSTOMERS_XLSX = "customers.xlsx"          # CustomerID, CustomerName, SalesManager (יכול להיות ריק)
-CUSTOMER_ITEMS_DIR = "customer_items"      # קבצי *.xlsx: CustomerID, ItemCode
-ORDERS_CSV = "orders.csv"                  # דמו (בהמשך DB)
+def _assert_columns(df: pd.DataFrame, required: set, fname: str) -> None:
+    missing = required.difference(df.columns)
+    if missing:
+        raise ValueError(f"{os.path.basename(fname)} missing columns: {missing}")
 
-SAP_CONST = {
-    "Sales Order Type": "ZOR",
-    "Sales Org": "1652",
-    "Distribution Channel": "01",
-    "Division": "01",
-    "Customer PO Reference": "Pepperi Backup",
-    "Unit of Measure": "CS",
-    "Purchase order type": "EXO",
-}
-
-# -----------------------------
-# טעינת נתונים + נירמול
-# -----------------------------
-def _strip_df(df, cols):
-    for c in cols:
-        if c in df.columns:
-            df[c] = df[c].astype(str).str.strip()
+def load_customers() -> pd.DataFrame:
+    df = pd.read_excel(CUSTOMERS_XLSX, dtype={"CustomerNumber": str})
+    _assert_columns(df, REQUIRED_CUSTOMERS, CUSTOMERS_XLSX)
+    # ניקוי קל
+    df["CustomerNumber"] = df["CustomerNumber"].str.strip()
+    df["CustomerName"] = df["CustomerName"].astype(str).str.strip()
+    df["SalesManager"] = df["SalesManager"].astype(str).str.strip()
+    # הסרת כפילויות אם יש
+    df = df.drop_duplicates(subset=["CustomerNumber"]).reset_index(drop=True)
     return df
 
-def load_items():
-    if not os.path.exists(ITEMS_XLSX):
-        raise FileNotFoundError(f"{ITEMS_XLSX} not found")
-    df = pd.read_excel(ITEMS_XLSX, dtype=str).fillna("")
-    expected = {"ItemCode", "ItemDescription", "Domain", "Category", "SubCategory"}
-    missing = expected - set(df.columns)
-    if missing:
-        raise ValueError(f"items.xlsx missing columns: {missing}")
-    return _strip_df(df, list(expected))
+def load_items() -> pd.DataFrame:
+    df = pd.read_excel(ITEMS_XLSX, dtype={"ItemCode": str})
+    _assert_columns(df, REQUIRED_ITEMS, ITEMS_XLSX)
+    df["ItemCode"] = df["ItemCode"].str.strip()
+    return df
 
-def load_customers():
-    if not os.path.exists(CUSTOMERS_XLSX):
-        raise FileNotFoundError(f"{CUSTOMERS_XLSX} not found")
-    df = pd.read_excel(CUSTOMERS_XLSX, dtype=str).fillna("")
-    must = {"CustomerID", "CustomerName"}
-    missing = must - set(df.columns)
-    if missing:
-        raise ValueError(f"customers.xlsx missing columns: {missing}")
-    if "SalesManager" not in df.columns:
-        df["SalesManager"] = ""
-    return _strip_df(df, ["CustomerID", "CustomerName", "SalesManager"])
-
-def load_customer_items():
-    if not os.path.isdir(CUSTOMER_ITEMS_DIR):
-        raise FileNotFoundError(f"{CUSTOMER_ITEMS_DIR} folder not found")
-    files = glob.glob(os.path.join(CUSTOMER_ITEMS_DIR, "*.xlsx"))
+def load_customer_allowed_items(customer_number: str) -> Optional[pd.DataFrame]:
+    """
+    קורא את קבצי הלקוח מתיקיית customer_items.
+    תמיכה בקובץ יחיד {Cust}.xlsx או כמה קבצים בשם {Cust}_*.xlsx.
+    מחזיר DF עם ItemCode, אחרת None אם אין קובץ – משמע מותר כל הפריטים.
+    """
+    pattern_main = os.path.join(CUSTOMER_ITEMS_DIR, f"{customer_number}.xlsx")
+    pattern_multi = os.path.join(CUSTOMER_ITEMS_DIR, f"{customer_number}_*.xlsx")
+    files = [*glob.glob(pattern_main), *glob.glob(pattern_multi)]
     if not files:
-        raise FileNotFoundError(f"No Excel files found in {CUSTOMER_ITEMS_DIR}")
+        return None
+
     frames = []
     for f in files:
-        d = pd.read_excel(f, dtype=str).fillna("")
-        expected = {"CustomerID", "ItemCode"}
-        missing = expected - set(d.columns)
-        if missing:
-            raise ValueError(f"{os.path.basename(f)} missing columns: {missing}")
-        d = _strip_df(d, ["CustomerID", "ItemCode"])
-        frames.append(d[["CustomerID", "ItemCode"]])
-    return pd.concat(frames, ignore_index=True)
-
-def ensure_orders_csv():
-    if not os.path.exists(ORDERS_CSV):
-        pd.DataFrame(columns=[
-            "order_id", "order_number_export", "customer_id", "created_at",
-            "delivery_date", "item_code", "quantity", "uom"
-        ]).to_csv(ORDERS_CSV, index=False, encoding="utf-8")
-
-def next_order_number_export():
-    ensure_orders_csv()
-    df = pd.read_csv(ORDERS_CSV, dtype=str)
-    if df.empty:
-        return 1
-    try:
-        return int(pd.to_numeric(df["order_number_export"], errors="coerce").max()) + 1
-    except Exception:
-        return 1
-
-def save_order(customer_id: str, delivery_date: str, line_items: list):
-    ensure_orders_csv()
-    now = datetime.utcnow()
-    created_at_iso = now.isoformat()
-    order_num = next_order_number_export()
-    order_id = f"{int(now.timestamp())}"
-
-    rows = []
-    for li in line_items:
-        rows.append({
-            "order_id": order_id,
-            "order_number_export": order_num,
-            "customer_id": customer_id,
-            "created_at": created_at_iso,
-            "delivery_date": delivery_date or "",
-            "item_code": li["item_code"],
-            "quantity": li["quantity"],
-            "uom": SAP_CONST["Unit of Measure"],
-        })
-    df_old = pd.read_csv(ORDERS_CSV, dtype=str) if os.path.exists(ORDERS_CSV) else pd.DataFrame()
-    df_new = pd.DataFrame(rows)
-    pd.concat([df_old, df_new], ignore_index=True).to_csv(ORDERS_CSV, index=False, encoding="utf-8")
-    return order_num
-
-def customers_with_display(df_customers: pd.DataFrame) -> pd.DataFrame:
-    df = df_customers.copy()
-    df["Display"] = df["CustomerID"].astype(str) + " – " + df["CustomerName"].astype(str)
-    return df
-
-def items_for_customer(df_items, df_customer_items, customer_id: str):
-    allowed = df_customer_items[df_customer_items["CustomerID"] == str(customer_id)]
-    return df_items.merge(allowed, on="ItemCode", how="inner")
-
-# -----------------------------
-# מסך ראשי
-# -----------------------------
-@app.route("/", methods=["GET", "POST"])
-def order_form():
-    admin_mode = request.args.get("admin") == "1"
-
-    df_items = load_items()
-    df_customers = load_customers()
-    df_cust_items = load_customer_items()
-    df_customers_disp = customers_with_display(df_customers)
-
-    # POST = שמירת הזמנה
-    if request.method == "POST":
-        customer_id = (request.form.get("customer_id") or "").strip()
-        delivery_date = (request.form.get("delivery_date") or "").strip()
-        if not customer_id:
-            return "❌ יש לבחור לקוח. <a href='/'>חזרה</a>"
-
-        posted = request.form.to_dict(flat=True)
-        line_items = []
-        for k, v in posted.items():
-            if not k.startswith("qty_"):
+        try:
+            df = pd.read_excel(f, dtype={"ItemCode": str})
+            # תומך באחת משתי אפשרויות שמות עמודות
+            if "ItemCode" not in df.columns and "MaterialNumber" in df.columns:
+                df = df.rename(columns={"MaterialNumber": "ItemCode"})
+            if "ItemCode" not in df.columns:
                 continue
-            code = k.replace("qty_", "")
-            try:
-                qty = float(v) if v.strip() != "" else 0.0
-            except Exception:
-                qty = 0.0
-            if qty > 0:
-                line_items.append({"item_code": code, "quantity": qty})
+            df["ItemCode"] = df["ItemCode"].astype(str).str.strip()
+            frames.append(df[["ItemCode"]].dropna())
+        except Exception:
+            continue
 
-        if not line_items:
-            return "❌ לא הוזנו כמויות מעל 0. <a href='/'>חזרה</a>"
+    if not frames:
+        return None
 
-        order_num = save_order(customer_id, delivery_date, line_items)
-        return redirect(url_for("success", order=order_num, admin=("1" if admin_mode else None)))
+    merged = pd.concat(frames, ignore_index=True).drop_duplicates()
+    return merged
 
-    # GET = סינוני לקוחות
-    sales_managers = sorted([sm for sm in df_customers["SalesManager"].unique() if sm])
-    customer_search = (request.args.get("customer_search") or "").strip()
-    sales_manager_filter = (request.args.get("sales_manager") or "").strip()
-    selected_customer = (request.args.get("customer_id") or "").strip()
+# -----------------------------
+# עזר לסינון לקוחות
+# -----------------------------
+def filter_customers(
+    customers: pd.DataFrame,
+    sales_manager: Optional[str],
+    query: Optional[str],
+) -> pd.DataFrame:
+    df = customers.copy()
+    if sales_manager and sales_manager.strip():
+        df = df[df["SalesManager"].str.casefold() == sales_manager.strip().casefold()]
 
-    df_cust_filtered = df_customers_disp.copy()
+    if query and query.strip():
+        q = query.strip().casefold()
+        by_number = df["CustomerNumber"].str.contains(q, case=False, na=False)
+        by_name = df["CustomerName"].str.casefold().str.contains(q, na=False)
+        df = df[by_number | by_name]
 
-    sm_arg = sales_manager_filter.lower()
-    if sm_arg:
-        df_cust_filtered = df_cust_filtered[
-            df_cust_filtered["SalesManager"].str.strip().str.lower() == sm_arg
-        ]
+    return df.sort_values(by=["CustomerName", "CustomerNumber"]).reset_index(drop=True)
 
-    if customer_search:
-        q = customer_search.lower()
-        df_cust_filtered = df_cust_filtered[
-            df_cust_filtered["CustomerID"].str.strip().str.lower().str.contains(q) |
-            df_cust_filtered["CustomerName"].str.strip().str.lower().str.contains(q)
-        ]
+# -----------------------------
+# נתיב בריאות ל-Render
+# -----------------------------
+@app.get("/health")
+def health() -> Tuple[str, int]:
+    return "ok", 200
 
-    # פריטים ללקוח
-    items_for_ui = pd.DataFrame(columns=df_items.columns)
-    domains, categories, subcats = [], [], []
+# -----------------------------
+# דף ראשי – טופס הזמנה
+# -----------------------------
+@app.get("/")
+def order_form():
+    customers = load_customers()
+    items = load_items()
+
+    # פרמטרים מה-UI לסינון לקוחות
+    sales_manager = request.args.get("sm", "").strip()
+    customer_query = request.args.get("cq", "").strip()
+    selected_customer = request.args.get("cid", "").strip()
+
+    filtered_customers = filter_customers(customers, sales_manager, customer_query)
+
+    # אם נבחר לקוח – נסנן את רשימת הפריטים לפי קבצי הלקוח
+    df_items_view = items.copy()
     if selected_customer:
-        df_allowed = items_for_customer(df_items, df_cust_items, selected_customer)
-        for col in ["Domain", "Category", "SubCategory"]:
-            if col in df_allowed.columns:
-                df_allowed[col] = df_allowed[col].astype(str).str.strip()
+        allowed = load_customer_allowed_items(selected_customer)
+        if allowed is not None and not allowed.empty:
+            df_items_view = df_items_view.merge(allowed, on="ItemCode", how="inner")
 
-        domain_filter = (request.args.get("domain") or "").strip()
-        category_filter = (request.args.get("category") or "").strip()
-        subcat_filter = (request.args.get("subcat") or "").strip()
-        item_search = (request.args.get("item_search") or "").strip().lower()
+    # הפיכת רשימות לתבנית
+    sales_managers = sorted(customers["SalesManager"].dropna().unique().tolist())
+    customers_list = filtered_customers[["CustomerNumber", "CustomerName"]].to_dict("records")
 
-        domains = sorted([d for d in df_allowed["Domain"].unique() if d])
-        if domain_filter:
-            df_allowed = df_allowed[df_allowed["Domain"] == domain_filter]
-
-        categories = sorted([c for c in df_allowed["Category"].unique() if c])
-        if category_filter:
-            df_allowed = df_allowed[df_allowed["Category"] == category_filter]
-
-        subcats = sorted([s for s in df_allowed["SubCategory"].unique() if s])
-        if subcat_filter:
-            df_allowed = df_allowed[df_allowed["SubCategory"] == subcat_filter]
-
-        if item_search:
-            df_allowed = df_allowed[
-                df_allowed["ItemCode"].str.lower().str.contains(item_search) |
-                df_allowed["ItemDescription"].str.lower().str.contains(item_search)
-            ]
-
-        items_for_ui = df_allowed.copy()
-
-    customers_list = df_cust_filtered.sort_values("CustomerID")[["CustomerID", "CustomerName", "Display"]].to_dict(orient="records")
-    items_list = items_for_ui[["ItemCode", "ItemDescription", "Domain", "Category", "SubCategory"]].to_dict(orient="records")
+    # קיבוץ פריטים לפי קטגוריה/תת-קטגוריה (למיון בתבנית)
+    df_items_view = df_items_view.sort_values(
+        by=["Category", "SubCategory", "ItemDescription", "ItemCode"]
+    ).reset_index(drop=True)
 
     return render_template(
         "form.html",
-        is_admin=admin_mode,
         sales_managers=sales_managers,
         customers=customers_list,
+        selected_manager=sales_manager,
+        customer_query=customer_query,
         selected_customer=selected_customer,
-        items=items_list,
-        domains=["(All)"] + domains if domains else [],
-        categories=["(All)"] + categories if categories else [],
-        subcats=["(All)"] + subcats if subcats else [],
+        items=df_items_view.to_dict("records"),
     )
 
-@app.route("/success")
-def success():
-    order = request.args.get("order")
-    admin = request.args.get("admin")
-    extra = "?admin=1" if admin == "1" else ""
-    return f"✅ ההזמנה נשמרה (Order Number: {order}). <a href='/{extra}'>חזרה לטופס</a> | <a href='/admin/export{extra}'>📄 ייצוא ל-SAP</a>"
-
 # -----------------------------
-# ייצוא CSV במבנה SAP (Admin)
+# קבלת הזמנה ושמירתה
 # -----------------------------
-@app.route("/admin/export")
-def export_sap():
-    if request.args.get("admin") != "1":
-        return "⛔ Admin only. הוסיפי ?admin=1 לכתובת.", 403
+@app.post("/submit")
+def submit_order():
+    """
+    מצפה לשדות:
+    - customer_id
+    - delivery_date (אופציונלי)
+    - order_rows: רשימת שורות {ItemCode, Quantity} בכמות > 0
+    """
+    data = request.get_json(silent=True) or request.form.to_dict(flat=False)
 
-    ensure_orders_csv()
-    if not os.path.exists(ORDERS_CSV):
-        return "אין הזמנות לייצא."
+    # תמיכה גם ב-form וגם ב-JSON
+    customer_id = (data.get("customer_id") or [""])[0] if isinstance(data, dict) else ""
+    delivery_date = (data.get("delivery_date") or [""])[0] if isinstance(data, dict) else ""
+    order_rows = data.get("order_rows", [])
 
-    df_orders = pd.read_csv(ORDERS_CSV, dtype=str)
-    if df_orders.empty:
-        return "אין הזמנות לייצא."
+    if not customer_id:
+        return jsonify({"ok": False, "error": "Missing customer_id"}), 400
 
-    date_from = request.args.get("from")
-    date_to   = request.args.get("to")
-    customer  = request.args.get("customer")
+    # המרת delivery_date
+    ref_date = datetime.utcnow().strftime("%d%m%Y")  # Reference Date בפורמט DDMMYYYY
 
-    def to_dt(s):
+    # קריאת קובץ הזמנות קיים (אם יש)
+    existing = []
+    if os.path.exists(ORDERS_XLSX):
         try:
-            return datetime.fromisoformat(s)
+            existing_df = pd.read_excel(ORDERS_XLSX, dtype=str)
+            existing = existing_df.to_dict("records")
+        except Exception:
+            existing = []
+
+    # Order Number רץ: 1 + המקסימום הקיים
+    try:
+        next_order_num = (
+            max([int(r.get("OrderNumber", 0)) for r in existing], default=0) + 1
+        )
+    except Exception:
+        next_order_num = 1
+
+    # המרת שורות להזמנה: נשמור רק כמות > 0
+    rows = []
+    for row in order_rows:
+        try:
+            code = str(row.get("ItemCode", "")).strip()
+            qty = float(row.get("Quantity", 0))
+        except Exception:
+            continue
+        if not code or qty <= 0:
+            continue
+
+        rows.append(
+            {
+                # שדות משתנים לפי הדרישה
+                "OrderNumber": str(next_order_num),
+                "CustomerNumber": str(customer_id),
+                "MaterialNumber": code,
+                "OrderQuantity": qty,
+                "CustomerReferenceDate": ref_date,
+                # שדות קבועים לדוגמת SAP – ניתן להתאים לפי הצורך
+                "SalesOrderType": "ZOR",
+                "SalesOrg": "1652",
+                "DistributionChannel": "01",
+                "Division": "01",
+                "SoldToParty": str(customer_id),
+                "ShipToParty": str(customer_id),
+                "CustomerPOReference": "Pepperi Backup",
+                "UnitOfMeasure": "CS",
+                "PurchaseOrderType": "EXO",
+            }
+        )
+
+    if not rows:
+        return jsonify({"ok": False, "error": "No items with quantity > 0"}), 400
+
+    # כתיבה לאקסל (מצטבר, לא מוחק)
+    final_df = pd.DataFrame([*existing, *rows])
+    final_df.to_excel(ORDERS_XLSX, index=False)
+
+    return jsonify({"ok": True, "order_number": next_order_num, "rows": len(rows)})
+
+# -----------------------------
+# ייצוא קובץ הזמנות (אדמין)
+# תמיכה במסננים: from_date (DDMMYYYY), to_date (DDMMYYYY)
+# -----------------------------
+@app.get("/export")
+def export_orders():
+    if not os.path.exists(ORDERS_XLSX):
+        # קובץ ריק
+        empty = pd.DataFrame(
+            columns=[
+                "OrderNumber",
+                "CustomerNumber",
+                "MaterialNumber",
+                "OrderQuantity",
+                "CustomerReferenceDate",
+                "SalesOrderType",
+                "SalesOrg",
+                "DistributionChannel",
+                "Division",
+                "SoldToParty",
+                "ShipToParty",
+                "CustomerPOReference",
+                "UnitOfMeasure",
+                "PurchaseOrderType",
+            ]
+        )
+        buf = io.BytesIO()
+        empty.to_excel(buf, index=False)
+        buf.seek(0)
+        return send_file(
+            buf,
+            as_attachment=True,
+            download_name=f"orders_export_{datetime.utcnow():%Y%m%d_%H%M}.xlsx",
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+    df = pd.read_excel(ORDERS_XLSX, dtype=str)
+    from_date = request.args.get("from_date", "").strip()
+    to_date = request.args.get("to_date", "").strip()
+
+    def _to_dt(s: str) -> Optional[datetime]:
+        try:
+            return datetime.strptime(s, "%d%m%Y")
         except Exception:
             return None
 
-    df_orders["created_at_dt"] = df_orders["created_at"].apply(to_dt)
+    if from_date or to_date:
+        fdt = _to_dt(from_date) if from_date else None
+        tdt = _to_dt(to_date) if to_date else None
+        # ממירים את השדה במידת הצורך
+        df["_dt"] = df["CustomerReferenceDate"].apply(_to_dt)
+        if fdt:
+            df = df[df["_dt"] >= fdt]
+        if tdt:
+            df = df[df["_dt"] <= tdt]
+        df = df.drop(columns=["_dt"])
 
-    if date_from:
-        try:
-            dfrom = datetime.fromisoformat(date_from + "T00:00:00")
-            df_orders = df_orders[df_orders["created_at_dt"] >= dfrom]
-        except Exception:
-            pass
-
-    if date_to:
-        try:
-            dto = datetime.fromisoformat(date_to + "T23:59:59")
-            df_orders = df_orders[df_orders["created_at_dt"] <= dto]
-        except Exception:
-            pass
-
-    if customer:
-        df_orders = df_orders[df_orders["customer_id"] == str(customer)]
-
-    if df_orders.empty:
-        return "לא נמצאו שורות להזמנה תחת הסינון שבחרת."
-
-    def ddmmyyyy(dt):
-        if not isinstance(dt, datetime):
-            return ""
-        return dt.strftime("%d%m%Y")
-
-    rows = []
-    for _, r in df_orders.iterrows():
-        created_dt = r["created_at_dt"]
-        rows.append({
-            "Order Number": int(r["order_number_export"]) if str(r["order_number_export"]).isdigit() else r["order_number_export"],
-            "Sales Order Type": SAP_CONST["Sales Order Type"],
-            "Sales Org": SAP_CONST["Sales Org"],
-            "Distribution Channel": SAP_CONST["Distribution Channel"],
-            "Division": SAP_CONST["Division"],
-            "Sold to Party": r["customer_id"],
-            "Ship to Party": r["customer_id"],
-            "Customer PO Reference": SAP_CONST["Customer PO Reference"],
-            "Customer Reference Date": ddmmyyyy(created_dt) if created_dt else "",
-            "Material Number": r["item_code"],
-            "Order Quantity": r["quantity"],
-            "Unit of Measure": SAP_CONST["Unit of Measure"],
-            "Purchase order type": SAP_CONST["Purchase order type"],
-        })
-
-    df_export = pd.DataFrame(rows)
-    try:
-        df_export = df_export.sort_values(by=["Order Number", "Material Number"], kind="stable")
-    except Exception:
-        pass
-
-    out = io.StringIO()
-    df_export.to_csv(out, index=False, encoding="utf-8")
-    return Response(
-        out.getvalue(),
-        mimetype="text/csv",
-        headers={"Content-Disposition": "attachment; filename=sap_orders_export.csv"}
+    # ייצוא
+    buf = io.BytesIO()
+    df.to_excel(buf, index=False)
+    buf.seek(0)
+    filename = f"orders_export_{datetime.utcnow():%Y%m%d_%H%M}.xlsx"
+    return send_file(
+        buf,
+        as_attachment=True,
+        download_name=filename,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
 # -----------------------------
-# run
+# הרצה ישירה (לוקאלי/Render)
 # -----------------------------
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), debug=True)
+    port = int(os.environ.get("PORT", 10000))
+    # מאפשר להריץ גם מקומית וגם על Render ללא Gunicorn
+    app.run(host="0.0.0.0", port=port)
