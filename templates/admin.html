@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+  <meta charset="utf-8" />
+  <title>אדמין</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style> body{font-family:system-ui,Arial,sans-serif;margin:16px;}
+  .row{display:flex;gap:12px;align-items:center;flex-wrap:wrap;}
+  .btn{padding:8px 12px;border:1px solid #ccc;background:#fafafa;cursor:pointer;border-radius:6px;}
+  input,select{padding:6px;}
+  </style>
+</head>
+<body>
+  <h2>אדמין</h2>
+
+  {% if not is_admin %}
+    <form method="post" action="{{ url_for('admin') }}">
+      <label>סיסמה:</label>
+      <input type="password" name="password" />
+      <button class="btn" type="submit">כניסה</button>
+    </form>
+  {% else %}
+    <div class="row">
+      <form method="get" action="{{ url_for('admin_export') }}">
+        <h4>ייצוא לאקסל (SAP)</h4>
+        <label>היקף:</label>
+        <select name="scope" id="scope" onchange="onScopeChange()">
+          <option value="all">כל ההזמנות</option>
+          <option value="range">טווח תאריכים</option>
+          <option value="since_last">מאז הייצוא האחרון</option>
+        </select>
+        <span id="rangeInputs" style="display:none">
+          <label>מ־</label><input type="datetime-local" name="from" />
+          <label>עד־</label><input type="datetime-local" name="to" />
+        </span>
+        <button class="btn" type="submit">הורד קובץ</button>
+      </form>
+    </div>
+
+    <div class="row" style="margin-top:12px">
+      <form method="post" action="{{ url_for('admin_reload') }}">
+        <button class="btn" type="submit">רענון נתונים (מקריאה מהדיסק)</button>
+      </form>
+      <a class="btn" href="{{ url_for('order_form') }}">חזרה לאפליקציה</a>
+    </div>
+
+    <script>
+      function onScopeChange(){
+        var v = document.getElementById('scope').value;
+        document.getElementById('rangeInputs').style.display = (v==='range') ? 'inline' : 'none';
+      }
+      onScopeChange();
+    </script>
+  {% endif %}
+
+</body>
+</html>
